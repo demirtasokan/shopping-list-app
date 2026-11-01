@@ -73,6 +73,8 @@
     .clear-btn:hover { color: #e03e3e; }
     .clear-btn:disabled { visibility: hidden; }
     .empty { text-align: center; color: #9aa5b1; padding: 24px 0; }
+    .status { min-height: 1.2em; margin: 0 0 12px; font-size: 0.9rem; color: #616e7c; }
+    .status.error { color: #e03e3e; }
   </style>
 </head>
 <body>
@@ -84,6 +86,8 @@
       <button type="submit" class="add-btn">Add</button>
     </form>
 
+    <p class="status" id="status" role="status"></p>
+
     <ul id="list"></ul>
     <p class="empty" id="empty">Your list is empty.</p>
 
@@ -94,7 +98,12 @@
   </main>
 
   <script>
-    const STORAGE_KEY = 'shopping-list-items';
+    // Supabase project. The publishable key is meant for browsers; what it can do
+    // is limited by the row-level security policies on public.shopping_items.
+    const SUPABASE_URL = 'https://gqmolxzpawmbzghxbfbu.supabase.co';
+    const SUPABASE_KEY = 'sb_publishable_XQFjN1r4zbk6RJBOKcU1SQ_4pxRI7rm';
+    const TABLE = 'shopping_items';
+    const LEGACY_STORAGE_KEY = 'shopping-list-items'; // old localStorage list, imported once
 
     const form = document.getElementById('add-form');
     const input = document.getElementById('item-input');
@@ -102,28 +111,46 @@
     const empty = document.getElementById('empty');
     const count = document.getElementById('count');
     const clearDone = document.getElementById('clear-done');
+    const statusEl = document.getElementById('status');
 
-    let items = loadItems();
+    let items = [];
 
-    function loadItems() {
-      try {
-        const saved = JSON.parse(localStorage.getItem(STORAGE_KEY));
-        return Array.isArray(saved) ? saved : [];
-      } catch {
-        return [];
-      }
+    function setStatus(message, isError = false) {
+      statusEl.textContent = message;
+      statusEl.classList.toggle('error', isError);
     }
 
-    function saveItems() {
-      try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(items));
-      } catch {
-        // Storage may be unavailable (e.g. private mode); the list still works for this session.
+    // Small wrapper around Supabase's REST API (PostgREST).
+    async function api(query, { method = 'GET', body, returning = false } = {}) {
+      const headers = { apikey: SUPABASE_KEY };
+      if (body !== undefined) headers['Content-Type'] = 'application/json';
+      if (returning) headers.Prefer = 'return=representation';
+
+      const res = await fetch(`${SUPABASE_URL}/rest/v1/${TABLE}${query}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (!res.ok) {
+        let detail = '';
+        try { detail = (await res.json()).message || ''; } catch { /* no JSON body */ }
+        throw new Error(detail || `Request failed (${res.status})`);
       }
+      // Inserts, updates and deletes answer with an empty body unless rows are returned.
+      const payload = await res.text();
+      return payload ? JSON.parse(payload) : null;
     }
 
-    function newId() {
-      return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+    // Run a database action; on failure show the error and redraw from known-good state.
+    async function run(action, failureMessage) {
+      try {
+        await action();
+        setStatus('');
+      } catch (err) {
+        console.error(err);
+        setStatus(`${failureMessage} (${err.message})`, true);
+      }
+      render();
     }
 
     function render() {
@@ -160,40 +187,79 @@
     }
 
     function addItem(text) {
-      items.push({ id: newId(), text, done: false });
-      saveItems();
-      render();
+      return run(async () => {
+        const [created] = await api('', { method: 'POST', body: { text }, returning: true });
+        items.push(created);
+      }, 'Could not add the item');
     }
 
     function toggleItem(id) {
       const item = items.find(i => i.id === id);
-      if (item) item.done = !item.done;
-      saveItems();
-      render();
+      if (!item) return;
+      const done = !item.done;
+      return run(async () => {
+        await api(`?id=eq.${encodeURIComponent(id)}`, { method: 'PATCH', body: { done } });
+        item.done = done;
+      }, 'Could not update the item');
     }
 
     function deleteItem(id) {
-      items = items.filter(i => i.id !== id);
-      saveItems();
+      return run(async () => {
+        await api(`?id=eq.${encodeURIComponent(id)}`, { method: 'DELETE' });
+        items = items.filter(i => i.id !== id);
+      }, 'Could not delete the item');
+    }
+
+    function clearChecked() {
+      return run(async () => {
+        await api('?done=eq.true', { method: 'DELETE' });
+        items = items.filter(i => !i.done);
+      }, 'Could not clear the checked items');
+    }
+
+    // One-time import of a list saved by the earlier localStorage version of this app.
+    async function importLegacyItems() {
+      let legacy;
+      try {
+        legacy = JSON.parse(localStorage.getItem(LEGACY_STORAGE_KEY));
+      } catch {
+        return;
+      }
+      if (!Array.isArray(legacy) || legacy.length === 0) return;
+
+      const rows = legacy
+        .filter(i => i && typeof i.text === 'string' && i.text.trim())
+        .map(i => ({ text: i.text.trim().slice(0, 100), done: Boolean(i.done) }));
+      if (rows.length) await api('', { method: 'POST', body: rows });
+      localStorage.removeItem(LEGACY_STORAGE_KEY); // only after the upload succeeded
+    }
+
+    async function loadItems() {
+      setStatus('Loading your list…');
+      try {
+        await importLegacyItems();
+        items = await api('?select=id,text,done&order=created_at.asc');
+        setStatus('');
+      } catch (err) {
+        console.error(err);
+        setStatus(`Could not load your list (${err.message})`, true);
+      }
       render();
     }
 
-    form.addEventListener('submit', (e) => {
+    form.addEventListener('submit', async (e) => {
       e.preventDefault();
       const text = input.value.trim();
       if (!text) return;
-      addItem(text);
       input.value = '';
+      await addItem(text);
       input.focus();
     });
 
-    clearDone.addEventListener('click', () => {
-      items = items.filter(i => !i.done);
-      saveItems();
-      render();
-    });
+    clearDone.addEventListener('click', clearChecked);
 
     render();
+    loadItems();
   </script>
 </body>
 </html>
